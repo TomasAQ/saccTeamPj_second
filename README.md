@@ -22,14 +22,17 @@
 
 ## 결과 화면
 
-Yolo 를 이용한 자동차 탐지
-![](result/yolo_result_1.png)
-<br><br>
-Deepsort를 활용한 거리 탐지 개선
-![](result/yolo_result_2.png)
-<br><br>
-수도레이블링을 통한 자동차 탐지
-![](result/yolo_result_3.png)
+Yolo 를 이용한 자동차 탐지   
+
+![](result/yolo_result_1.png)   
+
+Deepsort를 활용한 거리 탐지 개선   
+
+![](result/yolo_result_2.png)   
+
+수도레이블링을 통한 자동차 탐지   
+
+![](result/yolo_result_3.png)   
 
 ### source
     https://github.com/mikel-brostrom/Yolov5_DeepSort_Pytorch
