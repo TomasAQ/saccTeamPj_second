@@ -18,7 +18,8 @@ import torch.backends.cudnn as cudnn
 
 import numpy as np
 
-
+# OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized 발생 제거
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 
@@ -85,9 +86,207 @@ def draw_boxes(img, bbox, identities=None, offset=(0, 0)):
         # cv2.putText(img, label, (x1, y1 +t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
     return img
 
+################################################################################################################추가
+def canny(img, low_threshold, high_threshold):
+    return cv2.Canny(img, low_threshold, high_threshold)
 
 
-##########################################################################################################################
+def gaussian_blur(img, kernel_size):
+    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
+
+
+def get_pts(flag=0):
+    vertices1 = np.array([
+        [230, 650],
+        [620, 460],
+        [670, 460],
+        [1050, 650]
+    ])
+
+    vertices2 = np.array([
+        [0, 720],
+        [710, 400],
+        [870, 400],
+        [1280, 720]
+    ])
+    if flag == 0: return vertices1
+    if flag == 1: return vertices2
+
+
+def region_of_interest(img, vertices):
+    mask = np.zeros_like(img)
+
+    if len(img.shape) > 2:
+        channel_count = img.shape[2]
+        ignore_mask_color = (255,) * channel_count
+    else:
+        ignore_mask_color = 255
+
+    cv2.fillPoly(mask, vertices, ignore_mask_color)
+    # vertiecs로 만든 polygon으로 이미지의 ROI를 정하고 ROI 이외의 영역은 모두 검정색으로 정한다.
+
+    masked_image = cv2.bitwise_and(img, mask)
+    return masked_image
+
+
+def hough_lines(img, rho, theta, threshold, min_line_len, max_line_gap):
+    lines = cv2.HoughLinesP(img, rho, theta, threshold, np.array([]), minLineLength=min_line_len,
+                            maxLineGap=max_line_gap)
+    line_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
+    draw_lines(line_img, lines)
+    # cv2.imshow('r', img)
+
+    return line_img
+
+
+def weighted_img(img, initial_img, α=0.8, β=1., λ=0.):
+    return cv2.addWeighted(initial_img, α, img, β, λ)
+
+
+def get_slope(x1, y1, x2, y2):
+    return (y2 - y1) / (x2 - x1)
+
+
+def draw_lines(img, lines):
+    global cache
+    global first_frame
+    global next_frame
+
+    y_global_min = img.shape[0]
+    y_max = img.shape[0]
+
+    l_slope, r_slope = [], []
+    l_lane, r_lane = [], []
+
+    det_slope = 0.5
+    α = 0.2
+    if lines is not None:
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                slope = get_slope(x1, y1, x2, y2)
+                if slope > det_slope:
+                    r_slope.append(slope)
+                    r_lane.append(line)
+                elif slope < -det_slope:
+                    l_slope.append(slope)
+                    l_lane.append(line)
+
+        y_global_min = min(y1, y2, y_global_min)
+
+    if (len(l_lane) == 0 or len(r_lane) == 0):  # 오류 방지
+        return 1
+
+    l_slope_mean = np.mean(l_slope, axis=0)
+    r_slope_mean = np.mean(r_slope, axis=0)
+    l_mean = np.mean(np.array(l_lane), axis=0)
+    r_mean = np.mean(np.array(r_lane), axis=0)
+
+    if ((r_slope_mean == 0) or (l_slope_mean == 0)):
+        print('dividing by zero')
+        return 1
+
+    # y=mx+b -> b = y -mx
+    l_b = l_mean[0][1] - (l_slope_mean * l_mean[0][0])
+    r_b = r_mean[0][1] - (r_slope_mean * r_mean[0][0])
+
+    if np.isnan((y_global_min - l_b) / l_slope_mean) or \
+            np.isnan((y_max - l_b) / l_slope_mean) or \
+            np.isnan((y_global_min - r_b) / r_slope_mean) or \
+            np.isnan((y_max - r_b) / r_slope_mean):
+        return 1
+
+    l_x1 = int((y_global_min - l_b) / l_slope_mean)
+    l_x2 = int((y_max - l_b) / l_slope_mean)
+    r_x1 = int((y_global_min - r_b) / r_slope_mean)
+    r_x2 = int((y_max - r_b) / r_slope_mean)
+
+    if l_x1 > r_x1:  # Left line이 Right Line보다 오른쪽에 있는 경우 (Error)
+        l_x1 = ((l_x1 + r_x1) / 2)
+        r_x1 = l_x1
+
+        l_y1 = ((l_slope_mean * l_x1) + l_b)
+        r_y1 = ((r_slope_mean * r_x1) + r_b)
+        l_y2 = ((l_slope_mean * l_x2) + l_b)
+        r_y2 = ((r_slope_mean * r_x2) + r_b)
+
+    else:  # l_x1 < r_x1 (Normal)
+        l_y1 = y_global_min
+        l_y2 = y_max
+        r_y1 = y_global_min
+        r_y2 = y_max
+
+    current_frame = np.array([l_x1, l_y1, l_x2, l_y2, r_x1, r_y1, r_x2, r_y2], dtype="float32")
+
+    if first_frame == 1:
+        next_frame = current_frame
+        first_frame = 0
+    else:
+        prev_frame = cache
+        next_frame = (1 - α) * prev_frame + α * current_frame
+
+    global l_center
+    global r_center
+    global lane_center
+
+    div = 2
+    l_center = (int((next_frame[0] + next_frame[2]) / div), int((next_frame[1] + next_frame[3]) / div))
+    r_center = (int((next_frame[4] + next_frame[6]) / div), int((next_frame[5] + next_frame[7]) / div))
+    lane_center = (int((l_center[0] + r_center[0]) / div), int((l_center[1] + r_center[1]) / div))
+
+    global uxhalf, uyhalf, dxhalf, dyhalf
+    uxhalf = int((next_frame[2] + next_frame[6]) / 2)
+    uyhalf = int((next_frame[3] + next_frame[7]) / 2)
+    dxhalf = int((next_frame[0] + next_frame[4]) / 2)
+    dyhalf = int((next_frame[1] + next_frame[5]) / 2)
+
+    cv2.line(img, (next_frame[0], next_frame[1]), (next_frame[2], next_frame[3]), red, 2)
+    cv2.line(img, (next_frame[4], next_frame[5]), (next_frame[6], next_frame[7]), red, 2)
+
+    cache = next_frame
+
+
+def process_image(image):
+    height, width = image.shape[:2]
+
+    kernel_size = 3
+
+    # Canny Edge Detection Threshold
+    low_thresh = 150
+    high_thresh = 200
+
+    rho = 2
+    theta = np.pi / 180
+    thresh = 100
+    min_line_len = 50
+    max_line_gap = 150
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    img_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)  # 더 넓은 폭의 노란색 범위를 얻기위해 HSV를 이용한다.
+
+    lower_yellow = np.array([20, 100, 100], dtype="uint8")
+    upper_yellow = np.array([30, 255, 255], dtype="uint8")
+
+    mask_yellow = cv2.inRange(img_hsv, lower_yellow, upper_yellow)
+    mask_white = cv2.inRange(gray_image, 100, 255)
+
+    mask_yw = cv2.bitwise_or(mask_white, mask_yellow)  # 흰색과 노란색의 영역을 합친다.
+    mask_yw_image = cv2.bitwise_and(gray_image, mask_yw)  # Grayscale로 변환한 원본 이미지에서 흰색과 노란색만 추출
+
+    gauss_gray = gaussian_blur(mask_yw_image, kernel_size)
+
+    canny_edges = canny(gauss_gray, low_thresh, high_thresh)
+
+    vertices = [get_pts(flag=0)]
+    roi_image = region_of_interest(canny_edges, vertices)
+
+    line_image = hough_lines(roi_image, rho, theta, thresh, min_line_len, max_line_gap)
+    result = weighted_img(line_image, image, α=0.8, β=1., λ=0.)
+    # cv2.polylines(result, vertices, True, (0, 255, 255)) # ROI mask
+
+    return result, line_image
+
+
+################################################################################################################추가
+
 # 이미지 하단에서 검색된 이미지 사이에 거리 및 라인 그리기
 def drowLine(bbox_xyxy, im0):
     for i in range(len(bbox_xyxy)):
@@ -117,6 +316,32 @@ def drowLine(bbox_xyxy, im0):
                     cv2.LINE_AA)  # 거리값 보여주기
 
 
+# 차선 인식
+def laneDet(im0):
+    stencil = np.zeros_like(im0[:, :, 0])
+
+    point1 = [round(im0.shape[1] / 4), round(im0.shape[0] / 1.1)]
+    point2 = [round(im0.shape[1] / 4), round(im0.shape[0] / 1.44)]
+    point3 = [round(im0.shape[1] / 1.8), round(im0.shape[0] / 1.44)]
+    point4 = [round(im0.shape[1] / 1.8), round(im0.shape[0] / 1.1)]
+    polygon = np.array([[point1], [point2], [point3], [point4]])
+
+    cv2.fillConvexPoly(stencil, polygon, 1)
+    # apply frame mask
+    masked = cv2.bitwise_and(im0[:, :, 0], im0[:, :, 0], mask=stencil)
+    # apply image thresholding
+    ret, thresh = cv2.threshold(masked, 130, 145, cv2.THRESH_BINARY)
+    # apply Hough Line Transformation
+    lines = cv2.HoughLinesP(thresh, 1, np.pi / 180, 30, maxLineGap=200)
+
+    # Plot detected lines
+    try:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(im0, (x1, y1), (x2, y2), (255, 0, 0), 3)
+
+    except TypeError:
+        print('typeError!!!')
 
 
 def detect(opt, save_img=False):
@@ -223,7 +448,6 @@ def detect(opt, save_img=False):
             except TypeError:
                 cv2.imwrite("./saveImage/" + str(frame_idx) + '.png', im0)
             ############## 차선 인식 ~~~!!!  #########################################
-
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(
