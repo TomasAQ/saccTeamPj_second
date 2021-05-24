@@ -1,10 +1,8 @@
 import sys
 sys.path.insert(0, './yolov5')
 
-from yolov5.models.experimental import attempt_load
 from yolov5.utils.datasets import LoadImages, LoadStreams
-from yolov5.utils.general import check_img_size, non_max_suppression, scale_coords, \
-    check_imshow
+from yolov5.utils.general import check_img_size, non_max_suppression, scale_coords
 from yolov5.utils.torch_utils import select_device, time_synchronized
 from deep_sort_pytorch.utils.parser import get_config
 from deep_sort_pytorch.deep_sort import DeepSort
@@ -18,10 +16,34 @@ import cv2
 import torch
 import torch.backends.cudnn as cudnn
 
+import numpy as np
+
 
 
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 
+#############################################################
+frames = 0
+first_frame = 1
+# Color
+red = (0, 0, 255)
+green = (0, 255, 0)
+blue = (255, 0, 0)
+white = (255, 255, 255)
+yellow = (0, 255, 255)
+deepgray = (43, 43, 43)
+dark = (1, 1, 1)
+cyan = (255, 255, 0)
+magenta = (255, 0, 255)
+lime = (0, 255, 128)
+# Global 함수 초기화
+l_pos, r_pos, l_cent, r_cent = 0, 0, 0, 0
+uxhalf, uyhalf, dxhalf, dyhalf = 0, 0, 0, 0
+l_center, r_center, lane_center = ((0, 0)), ((0, 0)), ((0, 0))
+next_frame = (0, 0, 0, 0, 0, 0, 0, 0)
+
+
+############################################################################################
 
 def bbox_rel(*xyxy):
     """" Calculates the relative bounding box from absolute pixel values. """
@@ -57,16 +79,49 @@ def draw_boxes(img, bbox, identities=None, offset=(0, 0)):
         label = '{}{:d}'.format("", id)
         t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 2, 2)[0]
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
-        cv2.rectangle(
-            img, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), color, -1)
-        cv2.putText(img, label, (x1, y1 +
-                                 t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
+
+        # 상단에 라벨
+        # cv2.rectangle(img, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), color, -1)
+        # cv2.putText(img, label, (x1, y1 +t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
     return img
 
 
-def detect(opt):
-    out, source, weights, view_vid, save_vid, save_txt, imgsz = \
-        opt.output, opt.source, opt.weights, opt.view_vid, opt.save_vid, opt.save_txt, opt.img_size
+
+##########################################################################################################################
+# 이미지 하단에서 검색된 이미지 사이에 거리 및 라인 그리기
+def drowLine(bbox_xyxy, im0):
+    for i in range(len(bbox_xyxy)):
+        # 사진 기준
+        # 왼쪽 상단
+        xl = bbox_xyxy[i][0]
+        # 왼쪽 하단
+        yu = bbox_xyxy[i][1]
+        # 오른쪽 상단
+        xr = bbox_xyxy[i][2]
+        # 오른쪽 하단
+        yd = bbox_xyxy[i][3]
+
+        # 거리 계산
+        Distance = str(round((im0.shape[0] - yd) * (1 / 11.5), 2))  # 픽셀 : 실제 거리 = 1 : 1/11.5
+
+        # 라인 그리기
+        x2 = int(np.median(np.array([xl, xr])))
+        # 15m 이하 거리면 빨간색 나머지 초록색 라인
+        if float(Distance) < 15:
+            cv2.line(im0, (x2, yd), (x2, im0.shape[0]), (0, 0, 255), 3)
+        else:
+            cv2.line(im0, (x2, yd), (x2, im0.shape[0]), (0, 255, 0), 3)
+
+        font = cv2.FONT_HERSHEY_COMPLEX  # 폰트
+        cv2.putText(im0, Distance + 'm', (xl, int(np.median(np.array([im0.shape[0], yd])))), font, 0.4, (0, 0, 255), 1,
+                    cv2.LINE_AA)  # 거리값 보여주기
+
+
+
+
+def detect(opt, save_img=False):
+    out, source, weights, view_img, save_txt, imgsz = \
+        opt.output, opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size
     webcam = source == '0' or source.startswith(
         'rtsp') or source.startswith('http') or source.endswith('.txt')
 
@@ -87,32 +142,31 @@ def detect(opt):
     half = device.type != 'cpu'  # half precision only supported on CUDA
 
     # Load model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
-    stride = int(model.stride.max())  # model stride
-    imgsz = check_img_size(imgsz, s=stride)  # check img_size
-    names = model.module.names if hasattr(model, 'module') else model.names  # get class names
+    model = torch.load(weights, map_location=device)[
+        'model'].float()  # load to FP32
+    model.to(device).eval()
     if half:
         model.half()  # to FP16
 
     # Set Dataloader
     vid_path, vid_writer = None, None
-    # Check if environment supports image displays
-    if view_vid:
-        view_vid = check_imshow()
-
     if webcam:
+        view_img = True
         cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride)
+        dataset = LoadStreams(source, img_size=imgsz)
     else:
+        view_img = True
+        save_img = True
         dataset = LoadImages(source, img_size=imgsz)
 
     # Get names and colors
     names = model.module.names if hasattr(model, 'module') else model.names
 
     # Run inference
-    if device.type != 'cpu':
-        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
     t0 = time.time()
+    img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+    # run once
+    _ = model(img.half() if half else img) if device.type != 'cpu' else None
 
     save_path = str(Path(out))
     txt_path = str(Path(out)) + '/results.txt'
@@ -143,6 +197,33 @@ def detect(opt):
             s += '%gx%g ' % img.shape[2:]  # print string
             save_path = str(Path(out) / Path(p).name)
 
+            ######################### 차선인지 ##################################
+
+            prc_img, hough = process_image(im0)
+            im0 = prc_img.copy()
+            '''
+            stencil = np.zeros_like(im0[:,:,0])
+            polygon = np.array([[50,270], [220,160], [360,160], [480,270]])
+            cv2.fillConvexPoly(stencil, polygon, 1)
+            # apply frame mask
+            masked = cv2.bitwise_and(im0[:,:,0], im0[:,:,0], mask=stencil)
+            # apply image thresholding
+            ret, thresh = cv2.threshold(masked, 130, 145, cv2.THRESH_BINARY)
+            # apply Hough Line Transformation
+            lines = cv2.HoughLinesP(thresh, 1, np.pi/180, 30, maxLineGap=200)
+            im0 = im0.copy()
+            '''
+
+            # Plot detected lines
+            try:
+                # for line in lines:
+                # x1, y1, x2, y2 = line[0]
+                # cv2.line(im0, (x1, y1), (x2, y2), (255, 0, 0), 3)
+                cv2.imwrite("./saveImage/" + str(frame_idx) + '.png', im0)
+            except TypeError:
+                cv2.imwrite("./saveImage/" + str(frame_idx) + '.png', im0)
+            ############## 차선 인식 ~~~!!!  #########################################
+
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(
@@ -169,11 +250,45 @@ def detect(opt):
                 # Pass detections to deepsort
                 outputs = deepsort.update(xywhs, confss, im0)
 
+                # 이미지 list 에 저장
+                ################### my_code#############################
+                # 이미지 저장을 위한 로직
+                # if frame_idx % 90 == 1 :
+                #     # 원본 이미지 저장
+                #     cv2.imwrite("./saveImage/" + str(frame_idx) + "_ano.png", im0)
+                ################### my_code#############################
+
                 # draw boxes for visualization
                 if len(outputs) > 0:
                     bbox_xyxy = outputs[:, :4]
                     identities = outputs[:, -1]
                     draw_boxes(im0, bbox_xyxy, identities)
+                    ##################### my_code   #################################
+
+                    # 전체 이미지 크기
+                    # im0.shape
+
+                    # 검색된 box 정보
+                    # bbox_xyxy
+
+                    # 검색된 box 번호
+                    # print(identities[0])
+
+                    # print(identities)
+                    # print(bbox_xyxy)
+                    # print(len(bbox_xyxy))
+                    # print(im0.shape)
+
+                    # 거리 및 중앙에서 부터 박스 까지 선
+                    drowLine(bbox_xyxy, im0)
+
+                # cv2.imwrite("./saveImages/" + str(frame_idx) + "_label.png", im0)
+                # # 이미지 저장을 위한 로직
+                # if frame_idx % 30 == 1 :
+                #     # 처리된 이미지
+                #     cv2.imwrite("./saveImages/" + str(frame_idx) + "_label.png" , im0)
+
+                ##################### my_code   #################################
 
                 # Write MOT compliant results to file
                 if save_txt and len(outputs) != 0:
@@ -194,29 +309,34 @@ def detect(opt):
             print('%sDone. (%.3fs)' % (s, t2 - t1))
 
             # Stream results
-            if view_vid:
-                cv2.imshow(p, im0)
+            if view_img:
+
+                # 영상 제거 하기
+                # cv2.imshow(p, im0)
+
                 if cv2.waitKey(1) == ord('q'):  # q to quit
                     raise StopIteration
 
             # Save results (image with detections)
-            if save_vid:
-                if vid_path != save_path:  # new video
-                    vid_path = save_path
-                    if isinstance(vid_writer, cv2.VideoWriter):
-                        vid_writer.release()  # release previous video writer
-                    if vid_cap:  # video
+            if save_img:
+                print('saving img!')
+                if dataset.mode == 'images':
+                    cv2.imwrite(save_path, im0)
+                else:
+                    print('saving video!')
+                    if vid_path != save_path:  # new video
+                        vid_path = save_path
+                        if isinstance(vid_writer, cv2.VideoWriter):
+                            vid_writer.release()  # release previous video writer
+
                         fps = vid_cap.get(cv2.CAP_PROP_FPS)
                         w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        save_path += '.mp4'
+                        vid_writer = cv2.VideoWriter(
+                            save_path, cv2.VideoWriter_fourcc(*opt.fourcc), fps, (w, h))
+                    vid_writer.write(im0)
 
-                    vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                vid_writer.write(im0)
-
-    if save_txt or save_vid:
+    if save_txt or save_img:
         print('Results saved to %s' % os.getcwd() + os.sep + out)
         if platform == 'darwin':  # MacOS
             os.system('open ' + save_path)
@@ -230,7 +350,7 @@ if __name__ == '__main__':
                         default='yolov5/weights/yolov5s.pt', help='model.pt path')
     # file/folder, 0 for webcam
     parser.add_argument('--source', type=str,
-                        default='inference/images', help='source')
+                        default='/inferenceimages', help='source')
     parser.add_argument('--output', type=str, default='inference/output',
                         help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=640,
@@ -243,21 +363,20 @@ if __name__ == '__main__':
                         help='output video codec (verify ffmpeg support)')
     parser.add_argument('--device', default='',
                         help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--view-vid', action='store_false',
-                        help='display results')
-    parser.add_argument('--save-vid', action='store_true',
+    parser.add_argument('--view-img', action='store_true',
                         help='display results')
     parser.add_argument('--save-txt', action='store_true',
                         help='save results to *.txt')
     # class 0 is person
     parser.add_argument('--classes', nargs='+', type=int,
-                        default=[0], help='filter by class')
+                        default=[0, 1, 2], help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true',
                         help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true',
                         help='augmented inference')
     parser.add_argument("--config_deepsort", type=str,
                         default="deep_sort_pytorch/configs/deep_sort.yaml")
+
     args = parser.parse_args()
     args.img_size = check_img_size(args.img_size)
     print(args)
